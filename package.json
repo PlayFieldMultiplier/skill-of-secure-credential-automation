@@ -1,0 +1,14 @@
+{
+  "name": "skill-of-secure-credential-automation",
+  "version": "0.1.0",
+  "description": "Secure credential rotation using age encryption + GitHub Actions + local execution",
+  "type": "module",
+  "main": "scripts/rotate-credential.js",
+  "scripts": {
+    "test": "echo 'Run with --dry-run to test'"
+  },
+  "keywords": ["secrets", "credentials", "rotation", "age-encryption", "github-actions", "security"],
+  "author": "PlayFieldMultiplier",
+  "license": "ISC",
+  "engines": { "node": ">=20.0.0" }
+}
