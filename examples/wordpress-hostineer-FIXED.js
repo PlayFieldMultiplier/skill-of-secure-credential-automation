@@ -12,6 +12,16 @@
  * ✅ #2: Try/finally guarantees cleanup even on error
  * ✅ #3: Atomic file creation with correct permissions
  * ✅ #4: Dynamic age binary lookup with helpful error messaging
+ * ✅ #5: API key (Hostineer Authorization header) never appears in a shell
+ *   command string either. This one predates the original 4-vulnerability
+ *   audit and was missed in the first two review passes: the header value
+ *   was built via `$(echo ... | base64)` directly inside the curl command
+ *   text, so a curl failure would leak the plaintext API key through
+ *   Node's default execSync error message ("Command failed: <command>").
+ *   Fixed the same way as the SSH password: the secret never enters any
+ *   string Node treats as "the command" — it goes into a curl config file
+ *   (guaranteed-cleanup temp file, same pattern as the SSH key) that only
+ *   curl itself reads, referenced by path only.
  */
 
 const fs = require('fs');
@@ -89,20 +99,51 @@ async function rotateWordPressPassword(
   </soap:Body>
 </soap:Envelope>`;
 
+  // The Authorization header (contains apiKey) goes into a curl config file,
+  // never the command line — mirrors the SSH-key temp-file pattern below.
+  // curl reads headers from -K/--config; the SOAP body still comes via
+  // stdin (--data-binary @-). Neither secret ever becomes part of the
+  // string execSync tracks as "the command".
+  let curlConfigPath;
   try {
-    const response = execSync(`curl -s -X POST \\
-  -H "Authorization: Basic $(echo -n "api:${apiKey}" | base64)" \\
-  -H "Content-Type: application/soap+xml" \\
-  --data-binary @- \\
-  "${HOSTINEER_ENDPOINT}"`,
-      { input: soapRequest, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
-    );
+    const authValue = Buffer.from(`api:${apiKey}`).toString('base64');
+    curlConfigPath = path.join(process.env.TEMP || '/tmp', `curl-cfg-${Date.now()}`);
+    const fd = fs.openSync(curlConfigPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    try {
+      fs.writeSync(fd,
+        `header = "Authorization: Basic ${authValue}"\n` +
+        `header = "Content-Type: application/soap+xml"\n`
+      );
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    let response;
+    try {
+      response = execSync(
+        `curl -s -X POST -K "${curlConfigPath}" --data-binary @- "${HOSTINEER_ENDPOINT}"`,
+        { input: soapRequest, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+      );
+    } catch (e) {
+      // Deliberately not including e.message here: curl's own stderr on a
+      // network/HTTP failure could echo request context, and the config
+      // file path (safe) is the only thing in the command itself — but
+      // staying conservative costs nothing and this is exactly the class
+      // of bug this whole fix is about.
+      throw new Error('Failed to rotate password via SOAP API (curl invocation failed)');
+    }
 
     if (!response.includes('mysql_store_passwordResponse')) {
-      throw new Error(`SOAP API error: ${response}`);
+      throw new Error('SOAP API returned an unexpected response (body withheld from error to avoid leaking anything it may have echoed back)');
     }
-  } catch (e) {
-    throw new Error(`Failed to rotate password via SOAP API: ${e.message}`);
+  } finally {
+    if (curlConfigPath) {
+      try {
+        fs.unlinkSync(curlConfigPath);
+      } catch (e) {
+        console.error(`Warning: Failed to delete curl config at ${curlConfigPath}: ${e.message}`);
+      }
+    }
   }
 
   // Step 2: Update wp-config.php via SSH
