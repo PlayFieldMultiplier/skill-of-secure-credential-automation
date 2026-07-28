@@ -2,6 +2,28 @@
 
 **Abstract pattern for secure credential rotation across any organization, any secret, any infrastructure.**
 
+## Before writing any Hostineer-specific code, read this
+
+**Hostineer already ships a real CLI for exactly this kind of operation:
+`beacon`.** It's pre-installed on Hostineer boxes, exposes ~1,850
+documented commands (including MySQL user/database/password management),
+and runs already-authenticated over the box's own session — no hand-built
+SOAP XML, no custom `Authorization: Basic` header, no risk of a secret
+ending up in a shell command string at all.
+
+**Read this before touching any Hostineer credential automation:**
+https://kb.hostineer.com/control-panel/scripting-with-beacon/
+
+This is not optional background reading — the `examples/wordpress-hostineer*.js`
+scripts in this repo predate this being pointed out, reimplement Hostineer's
+SOAP API by hand via `curl`, and that reimplementation is *how the
+plaintext-password and plaintext-API-key leak vulnerabilities got
+introduced in the first place* (see `PlayFieldMultiplier/pfm-webops#41`,
+`#42`, 2026-07-28). A purpose-built CLI wouldn't need a secret constructed
+into a command string to begin with. Find the exact `beacon` command via
+`beacon show` / `beacon show sql` on the box before writing new curl/SOAP
+code against Hostineer.
+
 ## Problem
 
 Secrets (API keys, database passwords, tokens) need to be:
