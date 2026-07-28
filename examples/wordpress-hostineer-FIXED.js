@@ -24,10 +24,10 @@
  *   curl itself reads, referenced by path only.
  */
 
-const fs = require('fs');
-const path = require('path');
-const { execSync } = require('child_process');
-const crypto = require('crypto');
+import fs from 'fs';
+import path from 'path';
+import { execSync } from 'child_process';
+import crypto from 'crypto';
 
 // Find age binary dynamically instead of hardcoding path
 function findAgeBinary() {
@@ -222,7 +222,8 @@ function escapeShell(str) {
 }
 
 // Main
-if (require.main === module) {
+const isMainModule = process.argv[1] === new URL(import.meta.url).pathname;
+if (isMainModule) {
   const encryptedPath = process.argv[2] || './encrypted-hostineer-password';
   const keyPath = process.argv[3] || path.join(process.env.APPDATA || '', '.claude-age-key');
   const sshKeyPath = process.argv[4] || path.join(process.env.HOME || process.env.USERPROFILE || '', '.ssh', 'pfm_victorb_net');
@@ -241,4 +242,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { rotateWordPressPassword };
+export { rotateWordPressPassword };
