@@ -4,7 +4,11 @@
  * WordPress Hostineer Password Rotation — FIXED VERSION
  *
  * Security fixes applied:
- * ✅ #1: No plaintext password in shell command strings (uses heredoc)
+ * ✅ #1: Password never appears in a shell command string. It travels only
+ *   through execSync's `input` option (stdin), which Node does not include
+ *   in thrown-error messages — unlike a heredoc embedded in the command
+ *   text itself, which still leaks on failure. The remote script text
+ *   (fixed, no secret material) is the only thing passed as a command arg.
  * ✅ #2: Try/finally guarantees cleanup even on error
  * ✅ #3: Atomic file creation with correct permissions
  * ✅ #4: Dynamic age binary lookup with helpful error messaging
@@ -116,15 +120,24 @@ async function rotateWordPressPassword(
       fs.closeSync(fd);
     }
 
-    // Update wp-config.php using ssh
-    // Pass new password via heredoc to avoid plaintext in command line
-    const updateCommand = `ssh -i "${sshKeyPath}" -o StrictHostKeyChecking=no "${remoteHost}" << 'EOF'
-cd "$(dirname "${wpConfigPath}")"
-cp wp-config.php wp-config.php.backup
-sed -i "s/define('DB_PASSWORD', '[^']*'/define('DB_PASSWORD', '$(cat << 'PASS'\n${escapeShell(newPassword)}\nPASS\n)'/g" wp-config.php
-EOF`;
+    // Update wp-config.php using ssh. The remote script below contains no
+    // secret material — it's a fixed argument string, safe to interpolate.
+    // The password itself never appears in it: the remote side reads it
+    // from its own stdin (`NEWPW="$(cat)"`), which ssh forwards from this
+    // process's stdin. Node's execSync only ever captures the `command`
+    // string in a thrown error, never the `input` buffer — so even on SSH
+    // failure, the plaintext password is not present in any error/log.
+    const remoteScript =
+      `set -e; cd "$(dirname "${wpConfigPath}")"; ` +
+      `cp wp-config.php wp-config.php.backup; ` +
+      `NEWPW="$(cat)"; ` +
+      `sed -i "s/define('DB_PASSWORD', '[^']*')/define('DB_PASSWORD', '$NEWPW')/" wp-config.php`;
 
-    execSync(updateCommand, { stdio: 'pipe' });
+    const updateCommand =
+      `ssh -i "${sshKeyPath}" -o StrictHostKeyChecking=no "${remoteHost}" ` +
+      `'${escapeShell(remoteScript)}'`;
+
+    execSync(updateCommand, { input: newPassword, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
   } finally {
     // GUARANTEED cleanup: this runs even if ssh fails
     if (sshKeyPath) {
@@ -146,8 +159,9 @@ EOF`;
     throw new Error(`Failed to verify WordPress: ${e.message}`);
   }
 
+  // Never log the plaintext password — the caller gets it via the return
+  // value only, in-memory, and decides what to do with it from there.
   console.log('✓ Password rotated successfully');
-  console.log(`✓ New password: ${newPassword} (saved to secure location only)`);
   return { success: true, password: newPassword };
 }
 
