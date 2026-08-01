@@ -186,15 +186,22 @@ function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassw
 
     const base = [...beaconCmd, 'exec', `--keyfile=${keyfilePath}`, `--endpoint=${endpoint}`, '--format=json'];
 
+    // mysql_list_users's real shape (confirmed 2026-08-01 against production
+    // -- NOT a flat array of {user, host, ...} objects, which was the
+    // original, wrong assumption here): a nested object keyed by username,
+    // then by host, e.g. {"someuser": {"localhost": {ssl_type: "", ...}}}.
+    // There is no `host` field inside the innermost object -- the host is
+    // the key path itself, not a value to read back out.
     const listRaw = execFileSync(base[0], [...base.slice(1), 'mysql_list_users'], { encoding: 'utf-8' });
     const users = JSON.parse(listRaw);
-    const before = users.find(u => u.user === dbUser && (u.host === dbHost || dbHost === 'localhost'));
+    const userEntry = users[dbUser];
+    const before = userEntry && userEntry[dbHost];
     if (!before) {
       throw new Error(`MySQL user ${dbUser}@${dbHost} not found via mysql_list_users — refusing to guess its settings.`);
     }
 
     const preserved = {
-      host: before.host,
+      host: dbHost,
       max_user_connections: before.max_user_connections,
       max_updates: before.max_updates,
       max_questions: before.max_questions,
@@ -235,7 +242,7 @@ function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassw
     // Verify: re-read and confirm nothing but the password changed.
     const afterRaw = execFileSync(base[0], [...base.slice(1), 'mysql_list_users'], { encoding: 'utf-8' });
     const usersAfter = JSON.parse(afterRaw);
-    const after = usersAfter.find(u => u.user === dbUser && u.host === preserved.host);
+    const after = usersAfter[dbUser] && usersAfter[dbUser][preserved.host];
     if (!after) {
       throw new Error(`Post-rotation verification failed: ${dbUser}@${preserved.host} no longer found.`);
     }
