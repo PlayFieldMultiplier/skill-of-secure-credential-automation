@@ -12,16 +12,24 @@
  * ✅ #2: Try/finally guarantees cleanup even on error
  * ✅ #3: Atomic file creation with correct permissions
  * ✅ #4: Dynamic age binary lookup with helpful error messaging
- * ✅ #5: API key (Hostineer Authorization header) never appears in a shell
- *   command string either. This one predates the original 4-vulnerability
- *   audit and was missed in the first two review passes: the header value
- *   was built via `$(echo ... | base64)` directly inside the curl command
- *   text, so a curl failure would leak the plaintext API key through
- *   Node's default execSync error message ("Command failed: <command>").
- *   Fixed the same way as the SSH password: the secret never enters any
- *   string Node treats as "the command" — it goes into a curl config file
- *   (guaranteed-cleanup temp file, same pattern as the SSH key) that only
- *   curl itself reads, referenced by path only.
+ * ✅ #5: API key never appears in a shell command string. The secret enters
+ *   only a curl config file (guaranteed-cleanup temp file, same pattern as
+ *   the SSH key below) that only curl itself reads, referenced by path only.
+ *
+ * ✅ #6 (found and fixed 2026-08-01): this file's auth mechanism was wrong,
+ *   not just its secret-handling. It previously sent the API key as HTTP
+ *   Basic auth (`Authorization: Basic base64("api:" + apiKey)`) — that is
+ *   NOT how apnscp/Hostineer's SOAP API authenticates. Confirmed by reading
+ *   the vendor's own reference client (`apisnetworks/Beacon/Client.php`):
+ *   the real mechanism is an `?authkey=<key>` query parameter appended to
+ *   the endpoint URL. Verified live and current (2026-08-01) via
+ *   PlayFieldMultiplier/pfm-webops's own `.github/workflows/test-api-key.yml`,
+ *   which calls the real endpoint with this mechanism and gets a clean
+ *   response — Basic auth gets a 401 no matter how fresh/valid the key is.
+ *   Fixed here the same way as the header used to be handled: the key goes
+ *   into the curl config file's `url =` directive (never the command-line
+ *   string execSync tracks), not a header, since there is no header for
+ *   this API — the query-string *is* the auth.
  */
 
 import fs from 'fs';
@@ -99,19 +107,21 @@ async function rotateWordPressPassword(
   </soap:Body>
 </soap:Envelope>`;
 
-  // The Authorization header (contains apiKey) goes into a curl config file,
-  // never the command line — mirrors the SSH-key temp-file pattern below.
-  // curl reads headers from -K/--config; the SOAP body still comes via
-  // stdin (--data-binary @-). Neither secret ever becomes part of the
-  // string execSync tracks as "the command".
+  // apnscp/Hostineer's real auth is `?authkey=<key>` on the URL, not a
+  // header — so the URL itself (with the key embedded) goes into the curl
+  // config file's `url =` directive, never the command line. This mirrors
+  // the SSH-key temp-file pattern below: curl reads its target from
+  // -K/--config, the SOAP body still comes via stdin (--data-binary @-),
+  // and the secret never becomes part of the string execSync tracks as
+  // "the command".
   let curlConfigPath;
   try {
-    const authValue = Buffer.from(`api:${apiKey}`).toString('base64');
+    const endpointWithAuth = `${HOSTINEER_ENDPOINT}?authkey=${encodeURIComponent(apiKey)}`;
     curlConfigPath = path.join(process.env.TEMP || '/tmp', `curl-cfg-${Date.now()}`);
     const fd = fs.openSync(curlConfigPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
     try {
       fs.writeSync(fd,
-        `header = "Authorization: Basic ${authValue}"\n` +
+        `url = "${endpointWithAuth}"\n` +
         `header = "Content-Type: application/soap+xml"\n`
       );
     } finally {
@@ -121,7 +131,7 @@ async function rotateWordPressPassword(
     let response;
     try {
       response = execSync(
-        `curl -s -X POST -K "${curlConfigPath}" --data-binary @- "${HOSTINEER_ENDPOINT}"`,
+        `curl -s -X POST -K "${curlConfigPath}" --data-binary @-`,
         { input: soapRequest, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
       );
     } catch (e) {
