@@ -217,8 +217,29 @@ function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassw
     // apisnetworks/beacon's own README: `[imap:1,smtp:1]`), not one
     // bracket per key — that earlier guess was wrong and is exactly why
     // this script re-verifies unrelated fields after the write below.
+    //
+    // ✅ #9 (found and fixed 2026-08-01, the actual reason the site stayed
+    //   down all week despite every earlier "fix"): beacon's bracket-hash
+    //   parser silently drops the ENTIRE array — not just the empty key —
+    //   when any value is an empty string (a bare `key:` with nothing
+    //   before the next `,`/`]`). ssl_type/ssl_cipher/x509_subject/
+    //   x509_issuer default to `''` on this account, so every real call
+    //   this account ever made hit this: apnscp received an empty $opts,
+    //   changed nothing, and still returned `true` (ALTER USER with no
+    //   IDENTIFIED BY clause and unchanged limits succeeds trivially).
+    //   Verified directly against production: the identical call with
+    //   empty-string keys omitted actually changed both max_user_connections
+    //   and the password hash; with them included, neither ever changed,
+    //   across multiple fresh-password attempts. Fix: never emit a
+    //   `key:` with an empty value — omit that key instead (apnscp's own
+    //   defaults for these fields are already `''`, so omitting is
+    //   equivalent to sending it, without tripping the parser bug).
     const opts = { ...preserved, password: newPassword };
     const hashArg = '[' + MYSQL_EDIT_USER_OPT_KEYS
+      .filter(k => {
+        const v = opts[k];
+        return !(typeof v === 'string' && v === '');
+      })
       .map(k => `${k}:${typeof opts[k] === 'boolean' ? (opts[k] ? '1' : '0') : opts[k]}`)
       .join(',') + ']';
 
