@@ -163,7 +163,7 @@ function findOrInstallBeacon() {
  * locally against the account's API key (no SSH — see findOrInstallBeacon).
  * @param {string} apiKey - the Hostineer/apnscp API key (authkey)
  * @param {string} endpoint - the SOAP endpoint, e.g. https://falcon.hostineer.com:2083/soap
- * @param {string} dbUser - MySQL user to rotate (e.g. 'staging_pfm')
+ * @param {string} dbUser - MySQL user to rotate (real current value: check pfm-webops/HOSTINEER.md)
  * @param {string} dbHost - MySQL host clause for that user (usually 'localhost')
  * @param {string} newPassword - new plaintext password
  * @returns {object} the preserved settings, for post-write verification
@@ -268,8 +268,14 @@ function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassw
  * @param {string} sshKey - SSH private key for the target host (still needed for the wp-config.php file edit)
  * @param {string} remoteHost - SSH target (user@host)
  * @param {string} wpConfigPath - Remote path to wp-config.php
- * @param {string} dbUser - MySQL user whose password is being rotated
- * @param {string} dbHost - MySQL host clause for that user (usually 'localhost')
+ * @param {string} dbUser - MySQL user whose password is being rotated. No default on purpose:
+ *   this org's real current value lives in pfm-webops/HOSTINEER.md, which
+ *   also explicitly warns not to treat it as permanent across rebuilds --
+ *   a hardcoded default here would just relocate that same staleness risk
+ *   (this file previously defaulted to 'staging_pfm', which was never the
+ *   real value at all -- see pfm-webops/HOSTINEER.md's actual
+ *   'DB user and DB name are both rgon_stagingpfmvictorbnet').
+ * @param {string} dbHost - MySQL host clause for that user (usually 'localhost'). Also no default, same reason.
  */
 async function rotateWordPressPassword(
   encryptedArtifactPath,
@@ -278,9 +284,19 @@ async function rotateWordPressPassword(
   sshKey,
   remoteHost,
   wpConfigPath,
-  dbUser = 'staging_pfm',
-  dbHost = 'localhost'
+  dbUser,
+  dbHost
 ) {
+  if (!dbUser || !dbHost) {
+    throw new Error(
+      "dbUser and dbHost are required, with no default -- check pfm-webops/HOSTINEER.md " +
+      "(or the equivalent instance doc for whatever site this is) for the real current " +
+      "values before running this. This file previously defaulted dbUser to a " +
+      "plausible-looking guess ('staging_pfm') that was never the real value at all -- " +
+      "caught before it ran against production, but only by luck of it being noticed."
+    );
+  }
+
   // Generate new password (cryptographically secure)
   const newPassword = crypto.randomBytes(16).toString('hex');
 
@@ -370,7 +386,10 @@ if (isMainModule) {
   const sshKeyPath = process.argv[5] || path.join(process.env.HOME || process.env.USERPROFILE || '', '.ssh', 'pfm_victorb_net');
   const remoteHost = process.argv[6] || 'pfm#victorb.net@victorb.net';
   const wpConfigPath = process.argv[7] || '/var/www/staging.pfm.victorb.net/wp-config.php';
-  const dbUser = process.argv[8] || 'staging_pfm';
+  // No fallback default here on purpose -- see rotateWordPressPassword's
+  // own check. Pass the real current value explicitly (check
+  // pfm-webops/HOSTINEER.md, or the equivalent instance doc).
+  const dbUser = process.argv[8];
   const dbHost = process.argv[9] || 'localhost';
 
   rotateWordPressPassword(
