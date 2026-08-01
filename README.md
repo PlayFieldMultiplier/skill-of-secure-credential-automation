@@ -45,9 +45,8 @@ See `SETUP.md` for detailed step-by-step instructions.
 
 - `.github/workflows/encrypt-secret.yml` — Parameterizable GitHub Actions workflow that encrypts secrets
 - `scripts/rotate-credential.js` — Node.js template for credential rotation (SOAP API, REST, SQL, SSH, etc.)
-- `examples/` — Real-world implementations (WordPress, generic DB, API endpoints)
+- `examples/` — Real-world implementations
 - `SETUP.md` — Complete setup guide
-- `PROTOCOL.md` — Technical protocol details
 
 ## Security Guarantees
 
@@ -71,27 +70,41 @@ encrypt-via-github → download-encrypted → decrypt-locally → use-from-white
 
 ## Examples
 
-**WordPress database password** (`examples/wordpress-rotation.js`)
-- Encrypts Hostineer API key via GitHub
-- Calls SOAP API to rotate MySQL password
+**WordPress database password** (`examples/wordpress-hostineer-FIXED.js`)
+- Uses Hostineer/apnscp's real `?authkey=` SOAP auth (not `Authorization: Basic` —
+  see `SKILL-OF/hostineer-api-authentication` for why that matters)
+- Rotates the actual MySQL server-side user password via `mysql_edit_user`,
+  run through `beacon` (auto-installed if missing, no SSH required for this
+  step) — not `mysql_store_password`, which only rewrites a local cached
+  credential and never touches the database
 - Updates wp-config.php via SSH
-- Runs on 90-day schedule
+- `dbUser`/`dbHost` are required arguments with no default — the real
+  current value for a given account lives in that org's own ops repo
+  (e.g. `pfm-webops/HOSTINEER.md` for PlayFieldMultiplier), never guessed
+  or hardcoded here
+- Exports `rotateMysqlPasswordViaBeacon` separately for callers (like a
+  CI workflow) that already hold the API key as plaintext and don't need
+  the age-artifact indirection `rotateWordPressPassword` uses
 
-**Generic database password** (`examples/generic-db-rotation.js`)
-- Works with PostgreSQL, MySQL, MariaDB
-- Connects directly to database
-- Executes ALTER USER password command
-- Updates config file
+There was previously a second, older `examples/wordpress-hostineer.js` with
+neither of the two fixes above, despite a "TESTED AND VERIFIED" comment
+claiming otherwise, and a hardcoded path under one specific human's Windows
+profile. Removed 2026-08-01 — `wordpress-hostineer-FIXED.js` is now the
+only WordPress/Hostineer example in this repo, and there is no untested or
+partially-fixed sibling left to accidentally pick instead.
 
-**API key rotation** (`examples/api-key-rotation.js`)
-- Generic pattern for any REST API
-- Submits old key for revocation
-- Creates new key
-- Updates application config
+## A note on "tested and production-ready" claims in this repo's history
 
-## Testing
-
-All examples have been tested and are production-ready. See `examples/README.md` for verification status.
+An earlier version of this README claimed all examples were tested and
+production-ready. That claim was false for the WordPress example at the
+time it was written — real bugs (wrong auth mechanism, wrong SOAP method,
+wrong hash-argument syntax, a placeholder database username presented as
+real) were found and fixed on 2026-08-01, some of them only after being
+merged and referenced elsewhere as "the fixed version." Don't repeat that
+claim here again without it being true at the moment you write it — a
+confident status claim that isn't backed by an actual end-to-end run
+against production is worse than no claim at all, since it's what stops
+the next reader from checking.
 
 ## License
 
@@ -99,4 +112,7 @@ ISC License - See LICENSE file
 
 ## For the Agent Swarm
 
-This is a verified, auditable pattern for credential management. All agents should reference this skill when handling secrets.
+This is a credential-management pattern under active correction as real
+gaps are found — not a finished, self-certifying artifact. Read the actual
+code and its own inline history before trusting a claim in this file about
+what's verified.

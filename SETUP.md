@@ -51,6 +51,6 @@ Done! Your credential is now encrypted, rotated, and auditable.
 ## Full Documentation
 
 See:
-- `PROTOCOL.md` — Technical deep-dive
-- `examples/README.md` — Real-world examples (WordPress, database, API)
+- `README.md` — overview, use cases, and the real WordPress/Hostineer example
+  (`examples/wordpress-hostineer-FIXED.js`)
 - `scripts/rotate-credential.js` — Detailed template with customization points
