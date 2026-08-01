@@ -407,4 +407,10 @@ if (isMainModule) {
   });
 }
 
-export { rotateWordPressPassword };
+// rotateMysqlPasswordViaBeacon is exported separately from
+// rotateWordPressPassword because not every caller has (or needs) the
+// age-encrypted-artifact indirection: a GitHub Actions workflow already
+// holds the API key as plaintext in its own `secrets.*` context and would
+// gain nothing from an unnecessary encrypt/decrypt round-trip just to
+// call this. Import this directly and pass the key you already have.
+export { rotateWordPressPassword, rotateMysqlPasswordViaBeacon, findOrInstallBeacon };
