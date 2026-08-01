@@ -31,14 +31,14 @@
  *   lib/modules/mysql.php, confirmed by reading the real source at
  *   https://gitlab.com/apisnetworks/apnscp/-/blob/master/lib/modules/mysql.php
  *   — that's the authoritative implementation; the generated docs site at
- *   api.apiscp.com is frequently unreachable to automated agents in this
- *   environment due to a domain-wide TLS trust-chain failure, so GitLab
- *   source is the reliable reference, not a fallback). It never touches
- *   the real MySQL server-side user account, and it doesn't take a
- *   username argument at all (the script was sending one it silently
- *   ignored, or faulted on — either way, the actual database credential
- *   was never rotated, only wp-config.php would have been, leaving
- *   WordPress pointed at a password the database never received).
+ *   api.apnscp.com (and its api.apiscp.com alias) is unreachable from at
+ *   least one real agent-fetch tool via a domain-wide TLS trust-chain
+ *   failure, so GitLab source is the reliable reference, not a fallback).
+ *   It never touches the real MySQL server-side user account, and it
+ *   doesn't take a username argument at all (the script was sending one
+ *   it silently ignored, or faulted on — either way, the actual database
+ *   credential was never rotated, only wp-config.php would have been,
+ *   leaving WordPress pointed at a password the database never received).
  *
  *   The real method is `mysql_edit_user(user, host, opts)`. Its own
  *   docblock warns: whichever `opts` keys are omitted get silently reset
@@ -46,38 +46,49 @@
  *   because the PHP implementation always merges omitted keys against a
  *   hardcoded defaults array. So a partial opts payload correctly changes
  *   the password while silently clobbering that user's existing
- *   max-connections/SSL settings. To avoid that, this script now reads
- *   the user's CURRENT settings first (`mysql_list_users`) and resubmits
- *   them unchanged alongside the new password.
+ *   max-connections/SSL settings. To avoid that, this script reads the
+ *   user's CURRENT settings first (`mysql_list_users`) and resubmits them
+ *   unchanged alongside the new password.
  *
- *   `edit_user`'s `opts` parameter is a nested array/hash. Hand-rolling
- *   that as raw SOAP XML would mean guessing apnscp's WSDL struct
- *   encoding — the exact class of unverified guess that caused this bug
- *   in the first place. `beacon` (Hostineer's own CLI, see
- *   https://kb.hostineer.com/control-panel/scripting-with-beacon/) already
- *   knows how to serialize hash arguments correctly and runs
- *   pre-authenticated over the box's own session, so this step now prefers
- *   `beacon` over raw SOAP whenever it's present on the target host —
- *   checked at runtime, never assumed (per
- *   SKILL-OF/hostineer-api-authentication, beacon has been observed
- *   missing on at least one real account despite Hostineer's docs calling
- *   it preinstalled on all v5+ platforms). If `beacon` isn't present, this
- *   step refuses to guess the raw-SOAP struct encoding and fails loudly
- *   with actionable guidance instead of silently risking a wrong write to
- *   a live user account.
+ * ✅ #8 (found and fixed 2026-08-01, same day as #7): the first version of
+ *   this fix ran `beacon` over SSH into the target host, which assumes an
+ *   SSH key for that specific account — not every agent/machine running
+ *   this script has one, even though every one of them has (or can get)
+ *   the Hostineer API key. That's a real regression: it should not have
+ *   traded "guessing a struct encoding" for "requires a credential most
+ *   callers won't have." beacon itself doesn't need SSH at all — it
+ *   supports full remote operation via `--endpoint`/`--key`/`--keyfile`,
+ *   authenticating with the same API key this whole file already handles
+ *   (confirmed directly in apisnetworks/beacon's own README). So this now
+ *   runs `beacon` locally, wherever this script executes, against the
+ *   account's API key — see `findOrInstallBeacon()` and
+ *   `rotateMysqlPasswordViaBeacon()`. `beacon` doesn't need to be
+ *   preinstalled: it ships as a single ~10MB self-contained
+ *   `beacon.phar` (bundles its own PHP deps), downloaded straight from
+ *   https://github.com/apisnetworks/beacon if not already present —
+ *   the only real requirement is a PHP7.4+/8.x runtime.
  *
- *   NOTE: the multi-key `beacon exec` hash-argument syntax below
- *   (`[key:value][key2:value2]...`) is inferred from a single-key example
- *   in Hostineer's own docs — it has not yet been live-verified against a
- *   real account for a multi-key call. This script defends against a
- *   silently-wrong guess by re-reading the user's settings immediately
- *   after the edit and refusing to proceed to the wp-config.php update
- *   unless every non-password field still matches what was there before.
+ *   Also corrected the hash/array argument syntax for `beacon exec`: it's
+ *   ONE bracket with comma-separated `key:value` pairs
+ *   (`[host:x,password:y,...]`), confirmed directly against beacon's own
+ *   README example (`[imap:1,smtp:1]`) — the first version of this fix
+ *   guessed one bracket per key (`[host:x][password:y]...`), which was
+ *   wrong. The post-write re-read/diff check below is what would have
+ *   caught that wrong guess before it clobbered a live account's settings
+ *   — it stays in place as a general safeguard, not because the syntax is
+ *   still unverified.
+ *
+ *   Known limitation, not fully solved: beacon's CLI has no file/stdin
+ *   channel for an arbitrary `exec` argument value (only its own API key,
+ *   via `--keyfile`), so the new password is briefly present in this
+ *   process's own argv for the duration of the `mysql_edit_user` call —
+ *   visible to `ps` on a shared, multi-tenant machine. Only run this on a
+ *   trusted, single-tenant CI runner or agent machine.
  */
 
 import fs from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { execSync, execFileSync } from 'child_process';
 import crypto from 'crypto';
 
 // Fields mysql_edit_user's $opts accepts. Any key omitted here gets reset
@@ -89,106 +100,181 @@ const MYSQL_EDIT_USER_OPT_KEYS = [
   'use_ssl', 'ssl_type', 'ssl_cipher', 'x509_subject', 'x509_issuer',
 ];
 
+// Find age binary dynamically instead of hardcoding path
+function findAgeBinary() {
+  const possiblePaths = [
+    'age', // First try PATH
+    path.join(process.env.APPDATA || '', '..', 'Local', 'Temp', 'age-bin', 'age', 'age.exe'),
+    path.join(process.env.APPDATA || '', '..', 'Local', 'Temp', 'age-bin', 'age'), // Unix-style on Windows git-bash
+    path.join(process.env.ProgramFiles || '', 'age', 'age.exe'),
+  ];
+
+  for (const binPath of possiblePaths) {
+    try {
+      execSync(`"${binPath}" --version`, { stdio: 'pipe' });
+      return binPath;
+    } catch (e) {
+      // Try next path
+    }
+  }
+
+  throw new Error(
+    `Cannot find 'age' binary. Tried: ${possiblePaths.join(', ')}. ` +
+    `Install age or set it in PATH.`
+  );
+}
+
+const BEACON_PHAR_URL = 'https://raw.githubusercontent.com/apisnetworks/beacon/master/beacon.phar';
+const BEACON_CACHE_PATH = path.join(process.env.APPDATA || process.env.HOME || '/tmp', '.cache', 'beacon', 'beacon.phar');
+
 /**
- * Rotate WordPress database password via Hostineer's `beacon` CLI over SSH
- * @param {string} sshKeyPath - local path to the already-materialized SSH private key
- * @param {string} remoteHost - SSH target (user@host)
+ * Find a local `beacon` install, or fetch beacon.phar (a single self-contained
+ * file, ~10MB, bundles all its own PHP deps) straight from its own GitHub
+ * repo if nothing is found. This runs on whatever machine executes this
+ * script — beacon supports full remote operation via --endpoint/--key (see
+ * SKILL-OF/hostineer-api-authentication), so nothing here needs SSH access
+ * to the Hostineer account at all.
+ * @returns {string[]} the argv prefix to invoke beacon, e.g. ['php', '/path/to/beacon.phar']
+ */
+function findOrInstallBeacon() {
+  try {
+    execSync('beacon --version', { stdio: 'pipe' });
+    return ['beacon'];
+  } catch (e) {
+    // not on PATH, fall through
+  }
+  if (fs.existsSync(BEACON_CACHE_PATH)) {
+    return ['php', BEACON_CACHE_PATH];
+  }
+  fs.mkdirSync(path.dirname(BEACON_CACHE_PATH), { recursive: true });
+  execSync(`curl -sL -o "${BEACON_CACHE_PATH}" "${BEACON_PHAR_URL}"`, { stdio: 'pipe' });
+  const size = fs.statSync(BEACON_CACHE_PATH).size;
+  if (size < 1_000_000) {
+    // A real beacon.phar is ~10MB; anything much smaller is a download
+    // failure (e.g. a GitHub error page), not a valid PHAR.
+    fs.unlinkSync(BEACON_CACHE_PATH);
+    throw new Error(`Downloaded beacon.phar looks wrong (${size} bytes) -- refusing to use it.`);
+  }
+  return ['php', BEACON_CACHE_PATH];
+}
+
+/**
+ * Rotate WordPress database password via Hostineer's `beacon` CLI, run
+ * locally against the account's API key (no SSH — see findOrInstallBeacon).
+ * @param {string} apiKey - the Hostineer/apnscp API key (authkey)
+ * @param {string} endpoint - the SOAP endpoint, e.g. https://falcon.hostineer.com:2083/soap
  * @param {string} dbUser - MySQL user to rotate (e.g. 'staging_pfm')
  * @param {string} dbHost - MySQL host clause for that user (usually 'localhost')
  * @param {string} newPassword - new plaintext password
- * @returns {{maxUserConnections:number,maxUpdates:number,maxQuestions:number,useSsl:boolean,sslType:string,sslCipher:string,x509Subject:string,x509Issuer:string}} the preserved settings, for post-write verification
+ * @returns {object} the preserved settings, for post-write verification
  */
-function rotateMysqlPasswordViaBeacon(sshKeyPath, remoteHost, dbUser, dbHost, newPassword) {
-  const sshBase = `ssh -i "${sshKeyPath}" -o StrictHostKeyChecking=no "${remoteHost}"`;
+function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassword) {
+  const beaconCmd = findOrInstallBeacon();
 
-  const beaconPresent = execSync(`${sshBase} 'which beacon'`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] })
-    .trim().length > 0;
-  if (!beaconPresent) {
-    throw new Error(
-      "'beacon' CLI not found on remote host. Refusing to hand-roll the " +
-      "mysql_edit_user SOAP call instead: its opts parameter is a nested " +
-      "struct whose apnscp wire encoding has not been verified in this " +
-      "script, and guessing it risks silently corrupting the user's " +
-      "existing connection-limit/SSL settings (see file header). Install " +
-      "beacon on this host, or add a verified raw-SOAP struct encoding " +
-      "here only after confirming it against a read-only call first."
-    );
+  // beacon's own --keyfile flag keeps the API key out of argv (a file
+  // containing nothing but the key, per beacon's own README) -- same
+  // atomic-permissions/guaranteed-cleanup discipline as the SSH key below.
+  let keyfilePath;
+  try {
+    keyfilePath = path.join(process.env.TEMP || '/tmp', `beacon-key-${Date.now()}`);
+    const fd = fs.openSync(keyfilePath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
+    try {
+      fs.writeSync(fd, apiKey);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    const base = [...beaconCmd, 'exec', `--keyfile=${keyfilePath}`, `--endpoint=${endpoint}`, '--format=json'];
+
+    const listRaw = execFileSync(base[0], [...base.slice(1), 'mysql_list_users'], { encoding: 'utf-8' });
+    const users = JSON.parse(listRaw);
+    const before = users.find(u => u.user === dbUser && (u.host === dbHost || dbHost === 'localhost'));
+    if (!before) {
+      throw new Error(`MySQL user ${dbUser}@${dbHost} not found via mysql_list_users — refusing to guess its settings.`);
+    }
+
+    const preserved = {
+      host: before.host,
+      max_user_connections: before.max_user_connections,
+      max_updates: before.max_updates,
+      max_questions: before.max_questions,
+      use_ssl: !!before.ssl_type,
+      ssl_type: before.ssl_type || '',
+      ssl_cipher: before.ssl_cipher || '',
+      x509_subject: before.x509_subject || '',
+      x509_issuer: before.x509_issuer || '',
+    };
+
+    // Hash/array arguments to `beacon exec` are ONE bracket with
+    // comma-separated key:value pairs (confirmed directly against
+    // apisnetworks/beacon's own README: `[imap:1,smtp:1]`), not one
+    // bracket per key — that earlier guess was wrong and is exactly why
+    // this script re-verifies unrelated fields after the write below.
+    const opts = { ...preserved, password: newPassword };
+    const hashArg = '[' + MYSQL_EDIT_USER_OPT_KEYS
+      .map(k => `${k}:${typeof opts[k] === 'boolean' ? (opts[k] ? '1' : '0') : opts[k]}`)
+      .join(',') + ']';
+
+    // NOTE ON EXPOSURE: unlike the API key (via --keyfile) and the SSH key
+    // and wp-config password below (both via stdin), beacon's own CLI has
+    // no file/stdin channel for an arbitrary `exec` argument value — the
+    // new password must be passed as a real CLI argument here, so it is
+    // briefly visible in this process's argv (e.g. to `ps` on a shared,
+    // multi-tenant machine) for the duration of this one call. That is an
+    // inherent limitation of beacon's CLI design, not something this
+    // script can fully engineer around. Only run this on a trusted,
+    // single-tenant CI runner or agent machine, not a shared box. The
+    // thrown-error message below deliberately omits `e.message`/`e.output`
+        // so a failure doesn't compound the exposure via logs.
+    try {
+      execFileSync(base[0], [...base.slice(1), 'mysql_edit_user', dbUser, dbHost, hashArg], { stdio: 'pipe' });
+    } catch (e) {
+      throw new Error('mysql_edit_user call failed (details withheld -- see NOTE ON EXPOSURE above for why)');
+    }
+
+    // Verify: re-read and confirm nothing but the password changed.
+    const afterRaw = execFileSync(base[0], [...base.slice(1), 'mysql_list_users'], { encoding: 'utf-8' });
+    const usersAfter = JSON.parse(afterRaw);
+    const after = usersAfter.find(u => u.user === dbUser && u.host === preserved.host);
+    if (!after) {
+      throw new Error(`Post-rotation verification failed: ${dbUser}@${preserved.host} no longer found.`);
+    }
+    const drifted = ['max_user_connections', 'max_updates', 'max_questions', 'ssl_type', 'ssl_cipher', 'x509_subject', 'x509_issuer']
+      .filter(k => String(after[k] ?? '') !== String(before[k] ?? ''));
+    if (drifted.length > 0) {
+      throw new Error(
+        `mysql_edit_user changed unrelated settings, not just the password: ${drifted.join(', ')}. ` +
+        `Do not proceed to update wp-config.php; the two are now out of sync with the database's actual state.`
+      );
+    }
+
+    return preserved;
+  } finally {
+    if (keyfilePath) {
+      try {
+        fs.unlinkSync(keyfilePath);
+      } catch (e) {
+        console.error(`Warning: Failed to delete beacon keyfile at ${keyfilePath}: ${e.message}`);
+      }
+    }
   }
-
-  const listRaw = execSync(`${sshBase} 'beacon exec --format=json mysql_list_users'`, { encoding: 'utf-8' });
-  const users = JSON.parse(listRaw);
-  const before = users.find(u => u.user === dbUser && (u.host === dbHost || dbHost === 'localhost'));
-  if (!before) {
-    throw new Error(`MySQL user ${dbUser}@${dbHost} not found via mysql_list_users — refusing to guess its settings.`);
-  }
-
-  const preserved = {
-    host: before.host,
-    max_user_connections: before.max_user_connections,
-    max_updates: before.max_updates,
-    max_questions: before.max_questions,
-    use_ssl: !!before.ssl_type,
-    ssl_type: before.ssl_type || '',
-    ssl_cipher: before.ssl_cipher || '',
-    x509_subject: before.x509_subject || '',
-    x509_issuer: before.x509_issuer || '',
-  };
-
-  // Password never enters `opts` here, and never appears in any string
-  // built on this side — only a placeholder token does. The remote shell
-  // substitutes the real value from stdin ($PW) into that exact token
-  // position. This is the only way to keep the secret out of the command
-  // string execSync tracks (and would otherwise echo in a thrown error),
-  // matching the discipline already used for the SSH key and wp-config
-  // steps below.
-  const PW_PLACEHOLDER = '__NEWPW_PLACEHOLDER__';
-  const opts = { ...preserved, password: PW_PLACEHOLDER };
-  // Not yet live-verified for multi-key hashes — see file header note.
-  const hashArg = MYSQL_EDIT_USER_OPT_KEYS
-    .map(k => `[${k}:${typeof opts[k] === 'boolean' ? (opts[k] ? '1' : '0') : opts[k]}]`)
-    .join('');
-
-  const remoteEditScript =
-    `set -e; PW="$(cat)"; ` +
-    `beacon exec mysql_edit_user ${dbUser} ${dbHost} ` +
-    hashArg.replace(PW_PLACEHOLDER, '$PW');
-
-  execSync(`${sshBase} '${remoteEditScript.replace(/'/g, "'\\''")}'`, {
-    input: newPassword,
-    encoding: 'utf-8',
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-
-  // Verify: re-read and confirm nothing but the password changed.
-  const afterRaw = execSync(`${sshBase} 'beacon exec --format=json mysql_list_users'`, { encoding: 'utf-8' });
-  const usersAfter = JSON.parse(afterRaw);
-  const after = usersAfter.find(u => u.user === dbUser && u.host === preserved.host);
-  if (!after) {
-    throw new Error(`Post-rotation verification failed: ${dbUser}@${preserved.host} no longer found.`);
-  }
-  const drifted = ['max_user_connections', 'max_updates', 'max_questions', 'ssl_type', 'ssl_cipher', 'x509_subject', 'x509_issuer']
-    .filter(k => String(after[k] ?? '') !== String(before[k] ?? ''));
-  if (drifted.length > 0) {
-    throw new Error(
-      `mysql_edit_user changed unrelated settings, not just the password: ${drifted.join(', ')}. ` +
-      `The hash-argument encoding above is unverified for multi-key calls — this is exactly ` +
-      `the failure mode it was guarding against. Do not proceed to update wp-config.php; ` +
-      `the two are now out of sync with the database's actual state.`
-    );
-  }
-
-  return preserved;
 }
 
 /**
  * Rotate WordPress database password via Hostineer
- * @param {string} sshKey - SSH private key for the target host
+ * @param {string} encryptedArtifactPath - Path to age-encrypted Hostineer API key artifact from GitHub
+ * @param {string} privateKeyPath - Path to age private key
+ * @param {string} endpoint - Hostineer SOAP endpoint, e.g. https://falcon.hostineer.com:2083/soap
+ * @param {string} sshKey - SSH private key for the target host (still needed for the wp-config.php file edit)
  * @param {string} remoteHost - SSH target (user@host)
  * @param {string} wpConfigPath - Remote path to wp-config.php
  * @param {string} dbUser - MySQL user whose password is being rotated
  * @param {string} dbHost - MySQL host clause for that user (usually 'localhost')
  */
 async function rotateWordPressPassword(
+  encryptedArtifactPath,
+  privateKeyPath,
+  endpoint,
   sshKey,
   remoteHost,
   wpConfigPath,
@@ -197,6 +283,21 @@ async function rotateWordPressPassword(
 ) {
   // Generate new password (cryptographically secure)
   const newPassword = crypto.randomBytes(16).toString('hex');
+
+  // Decrypt the Hostineer API key -- needed for the beacon-based MySQL
+  // step below, which runs locally against this key and never touches SSH.
+  let apiKey;
+  try {
+    const ageBinary = findAgeBinary();
+    const encryptedData = fs.readFileSync(encryptedArtifactPath);
+    const decrypted = execFileSync(
+      ageBinary, ['--decrypt', '-i', privateKeyPath],
+      { input: encryptedData, encoding: 'utf-8' }
+    );
+    apiKey = decrypted.trim();
+  } catch (e) {
+    throw new Error(`Failed to decrypt API key: ${e.message}`);
+  }
 
   // Write SSH key with atomic permissions (never world-readable window)
   let sshKeyPath;
@@ -209,9 +310,10 @@ async function rotateWordPressPassword(
       fs.closeSync(fd);
     }
 
-    // Step 1: rotate the real MySQL user password via beacon, preserving
+    // Step 1: rotate the real MySQL user password via beacon, run locally
+    // against the API key (no SSH needed for this step) -- preserving
     // every other setting on that account (see rotateMysqlPasswordViaBeacon).
-    rotateMysqlPasswordViaBeacon(sshKeyPath, remoteHost, dbUser, dbHost, newPassword);
+    rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassword);
 
     // Step 2: update wp-config.php to match, now that the database
     // actually has the new password. Use try/finally to GUARANTEE cleanup
@@ -262,13 +364,19 @@ function escapeShell(str) {
 // Main
 const isMainModule = process.argv[1] === new URL(import.meta.url).pathname;
 if (isMainModule) {
-  const sshKeyPath = process.argv[2] || path.join(process.env.HOME || process.env.USERPROFILE || '', '.ssh', 'pfm_victorb_net');
-  const remoteHost = process.argv[3] || 'pfm#victorb.net@victorb.net';
-  const wpConfigPath = process.argv[4] || '/var/www/staging.pfm.victorb.net/wp-config.php';
-  const dbUser = process.argv[5] || 'staging_pfm';
-  const dbHost = process.argv[6] || 'localhost';
+  const encryptedPath = process.argv[2] || './encrypted-hostineer-password';
+  const keyPath = process.argv[3] || path.join(process.env.APPDATA || '', '.claude-age-key');
+  const endpoint = process.argv[4] || 'https://falcon.hostineer.com:2083/soap';
+  const sshKeyPath = process.argv[5] || path.join(process.env.HOME || process.env.USERPROFILE || '', '.ssh', 'pfm_victorb_net');
+  const remoteHost = process.argv[6] || 'pfm#victorb.net@victorb.net';
+  const wpConfigPath = process.argv[7] || '/var/www/staging.pfm.victorb.net/wp-config.php';
+  const dbUser = process.argv[8] || 'staging_pfm';
+  const dbHost = process.argv[9] || 'localhost';
 
   rotateWordPressPassword(
+    encryptedPath,
+    keyPath,
+    endpoint,
     fs.readFileSync(sshKeyPath, 'utf-8'),
     remoteHost,
     wpConfigPath,
