@@ -17,19 +17,16 @@
  *   the SSH key below) that only curl itself reads, referenced by path only.
  *
  * ✅ #6 (found and fixed 2026-08-01): this file's auth mechanism was wrong,
- *   not just its secret-handling. It previously sent the API key as HTTP
- *   Basic auth (`Authorization: Basic base64("api:" + apiKey)`) — that is
- *   NOT how apnscp/Hostineer's SOAP API authenticates. Confirmed by reading
- *   the vendor's own reference client (`apisnetworks/Beacon/Client.php`):
- *   the real mechanism is an `?authkey=<key>` query parameter appended to
- *   the endpoint URL. Verified live and current (2026-08-01) via
- *   PlayFieldMultiplier/pfm-webops's own `.github/workflows/test-api-key.yml`,
- *   which calls the real endpoint with this mechanism and gets a clean
- *   response — Basic auth gets a 401 no matter how fresh/valid the key is.
- *   Fixed here the same way as the header used to be handled: the key goes
+ *   not just its secret-handling — it previously sent the API key as HTTP
+ *   Basic auth, which apnscp/Hostineer's SOAP API does not accept. See
+ *   https://github.com/SKILL-OF/hostineer-api-authentication for the full
+ *   finding, how it was verified, and why (that's now the canonical home
+ *   for this fact — it's true for any Hostineer account, not just this
+ *   organization's, so it doesn't live only here as inline history).
+ *   Fixed here the same way the header used to be handled: the key goes
  *   into the curl config file's `url =` directive (never the command-line
- *   string execSync tracks), not a header, since there is no header for
- *   this API — the query-string *is* the auth.
+ *   string execSync tracks), not a header — there is no header for this
+ *   API, the query string *is* the auth.
  */
 
 import fs from 'fs';
