@@ -304,6 +304,12 @@ function rotateMysqlPasswordViaBeacon(apiKey, endpoint, dbUser, dbHost, newPassw
  *   real value at all -- see pfm-webops/HOSTINEER.md's actual
  *   'DB user and DB name are both rgon_stagingpfmvictorbnet').
  * @param {string} dbHost - MySQL host clause for that user (usually 'localhost'). Also no default, same reason.
+ * @param {string} verifyUrl - URL to curl after rotation to confirm the site is
+ *   actually serving correctly (e.g. https://staging-pfm.victorb.net/). No
+ *   default on purpose: this file previously hardcoded staging-pfm's URL here,
+ *   which meant rotating any *other* site's password would still "verify"
+ *   against staging-pfm and pass even if the real target site was down --
+ *   see pfm-webops#56/#57 for the sibling bug this mirrors in the deploy path.
  */
 async function rotateWordPressPassword(
   encryptedArtifactPath,
@@ -313,8 +319,16 @@ async function rotateWordPressPassword(
   remoteHost,
   wpConfigPath,
   dbUser,
-  dbHost
+  dbHost,
+  verifyUrl
 ) {
+  if (!verifyUrl) {
+    throw new Error(
+      "verifyUrl is required, with no default -- pass the real site URL to verify " +
+      "after rotation (e.g. https://staging-pfm.victorb.net/). A hardcoded default " +
+      "here would silently verify the wrong site when rotating a different one."
+    );
+  }
   if (!dbUser || !dbHost) {
     throw new Error(
       "dbUser and dbHost are required, with no default -- check pfm-webops/HOSTINEER.md " +
@@ -384,9 +398,13 @@ async function rotateWordPressPassword(
     }
   }
 
-  // Step 3: Verify WordPress is online
+  // Step 3: Verify WordPress is online -- against the site actually being
+  // rotated, not a hardcoded one (see verifyUrl's own doc comment above).
   try {
-    const response = execSync('curl -s -o /dev/null -w "%{http_code}" https://staging-pfm.victorb.net/', { encoding: 'utf-8' });
+    const response = execFileSync(
+      'curl', ['-sk', '-o', '/dev/null', '-w', '%{http_code}', '--max-time', '15', verifyUrl],
+      { encoding: 'utf-8' }
+    );
     if (response.trim() !== '200') {
       throw new Error(`WordPress returned HTTP ${response}, expected 200`);
     }
@@ -419,6 +437,8 @@ if (isMainModule) {
   // pfm-webops/HOSTINEER.md, or the equivalent instance doc).
   const dbUser = process.argv[8];
   const dbHost = process.argv[9] || 'localhost';
+  // Also no default -- see verifyUrl's own doc comment above.
+  const verifyUrl = process.argv[10];
 
   rotateWordPressPassword(
     encryptedPath,
@@ -428,7 +448,8 @@ if (isMainModule) {
     remoteHost,
     wpConfigPath,
     dbUser,
-    dbHost
+    dbHost,
+    verifyUrl
   ).catch(err => {
     console.error(`ERROR: ${err.message}`);
     process.exit(1);
